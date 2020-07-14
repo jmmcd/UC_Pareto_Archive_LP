@@ -1,0 +1,32 @@
+* 20 June 2020:
+
+Pareto Archive search.
+
+* 16 June 2020:
+
+Implemented IP and LP versions.
+IP uses [LB, UB] int variables but I let it run for 5h30m, then killed it.
+LP returns instantly. Continuous variables, ie no rounding and we define effective supply = demand.
+Probably the best approach is a large grid search over LP weights.
+generate_wts.py does this, but it would be nicer to do a pareto_lp inside here to avoid saving zillions of useless files. just pass 0 for every wt on command-line then grid-search inside here.
+
+* 16 Jan 2020:
+
+According to email from Svetlana, just ignore the solar
+issue because of use of accumulators in the solar
+
+* 15 Jan 2020:
+
+Changed to [0, 1]
+Fixed solar at max
+Applied solar daylight factor
+Saved Rounded and Relative supply
+Avoid Seed 0 as CMA doesn't respect it
+Use only one weight for env cost as it is similar to sus cost
+Set peakedness weight to zero as it only applies to thermal and we are making those constant anyway
+Fixed then re-fixed the number of return values from es.result, possibly result of CMA version mismatch
+Upped sigma to 0.99 which seems ok, but 1.0 gives error.
+
+* 2019:
+
+Using CMA-ES, NSGA2, and other approaches to search for production schedules directly.
