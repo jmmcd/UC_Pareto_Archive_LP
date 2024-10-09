@@ -331,19 +331,58 @@ def lp_solve(technology_cost_wt,
         objective.SetMinimization()
         result = solver.Solve()
 
+    # print_sensitivity(solver)
+        
     # save the solution x and four individual objective values
     x = np.zeros_like(UB, dtype=float)
     for i in range(nplants):
         for j in range(nhours):
             x[i,j] = X[i][j].solution_value()
 
+
     PC = PC.solution_value()
     Em = Em.solution_value()
     EC = EC.solution_value()
     SC = SC.solution_value()
 
+
+
     return x, (PC, Em, EC, SC)
 
+
+def print_sensitivity(solver):
+    # is this a continuous problem? we can do more sensitivity
+    # analysis if so.
+    continuous_problem = all(v.Integer() == False for v in solver.variables())
+
+    # the *reduced cost* for a variable is the change in objective
+    # coefficient for the variable which would be required to move the
+    # location of the optimum
+    if continuous_problem:
+        for v in solver.variables():
+            print(f"{v.name()} = {v.solution_value():.5}; reduced cost {v.reduced_cost():.5}")
+        
+    # for c, a in zip(solver.constraints(), solver.ComputeConstraintActivities()):
+    #     eps = 0.0000001
+    #     # a constraint is *binding* if it is actually preventing the
+    #     # optimum from improving -- the constraint line goes through
+    #     # the optimum. we print a "*" for binding constraints. eg the
+    #     # active ingredient constraint is binding.
+
+    #     # the *dual value* aka *shadow price* of a constraint is the
+    #     # amount our profit could improve if the RHS of the constraint
+    #     # would improve by 1 unit. for non-binding constraints, the
+    #     # dual is 0. if we had an extra 1L of active ingredient, we
+    #     # would get an extra EUR100 of profit
+    #     binding = "* " if abs(a - c.lb()) < eps or abs(a - c.ub()) < eps else "  "
+
+    #     ctxt = " + ".join(f"{c.GetCoefficient(v):.5}*{v.name()}"
+    #                       for v in solver.variables())
+        
+    #     if continuous_problem:
+    #         print(f"{binding} {c.name()}: {c.lb():.5} <= {ctxt} = {a:.5} <= {c.ub():.5}; dual {c.DualValue():.5}")
+    #     else:
+    #         print(f"{binding} {c.name()}: {c.lb():.5} <= {ctxt} = {a:.5} <= {c.ub():.5}")
 
 
 
@@ -389,6 +428,26 @@ def grid_search_lp_wts():
     return xs[pareto_front(costs)]
 
 
+def grid_search_lp_wts2():
+    # take wt in 10,000 steps in [0, 1] and use that as prod wt
+    # and 1-wt as emissions wt (ignore others as correlated
+    # with emissions).
+
+    costs = []
+    xs = []
+    for wt in np.linspace(0, 1, 10001):
+        print(wt)
+        x, c = lp_solve(wt, 1-wt, 0, 0)
+        if c not in costs:
+            costs.append(c)
+            xs.append(x)
+    costs = np.array(costs)
+    xs = np.array(xs)
+    
+    return xs[pareto_front(costs)]
+
+
+
 def pareto_archive_lp_wts(popsize, gens):
     # Pareto archive search over weights
 
@@ -398,7 +457,10 @@ def pareto_archive_lp_wts(popsize, gens):
         return [halfnormal(0, 10) for _ in range(4)]
     def mutate(x):
         i = random.randrange(len(x))
-        x[i] *= halfnormal(0, 10)
+        if x[i] == 0:
+            x[i] += halfnormal(0, 10)
+        else:
+            x[i] *= halfnormal(0, 10)
         return x
     def wt_fitness(x):
         x, c = lp_solve(*x)
@@ -462,15 +524,19 @@ if __name__ == "__main__":
     
     if algo == "lp":
         # just for a quick test, min prod cost
-        x, costs = lp_solve(1, 0, 0, 0) 
-        print(x)
-        print(costs)
-        fx = f(x)
-        print(fx['technology_cost'], fx['emissions'], fx['env_cost'], fx['sus_cost'])
+        for wt in np.linspace(0.13123232323232323, 0.13135353535353536, 100):
+            x, costs = lp_solve(wt, 1-wt, 0, 0) 
+            # print(x)
+            # print(costs)
+            fx = f(x)
+            print(wt)
+            print(fx['technology_cost'], fx['emissions'], fx['env_cost'], fx['sus_cost'])
         sys.exit()
         
     elif algo == "grid_search":
         xs = grid_search_lp_wts()
+    elif algo == "grid_search2":
+        xs = grid_search_lp_wts2()
     elif algo == "pareto_archive":
         xs = pareto_archive_lp_wts(1000, 10)
     elif algo == "random_search":
