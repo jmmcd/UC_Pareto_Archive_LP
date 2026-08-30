@@ -28,6 +28,13 @@ RUN_GRID_SEARCH2=${RUN_GRID_SEARCH2:-false}
 RUN_GRID_SEARCH_NORM=${RUN_GRID_SEARCH_NORM:-false}
 RUN_GRID_SEARCH2_NORM=${RUN_GRID_SEARCH2_NORM:-false}
 RUN_RANDOM_SEARCH=${RUN_RANDOM_SEARCH:-false}
+RUN_EPSILON_GRID_SEARCH=${RUN_EPSILON_GRID_SEARCH:-false}
+
+# run.py lives in src/ and expects to be run from there: it reads
+# ../data/ and writes ../results/. locate ourselves rather than
+# depending on the caller's working directory, so that this script can
+# be run from anywhere.
+cd "$(dirname "$0")/../src"
 
 RESULTS=../results
 
@@ -82,6 +89,15 @@ if [ "$RUN_GRID_SEARCH" = true ];       then run_deterministic grid_search;     
 if [ "$RUN_GRID_SEARCH2" = true ];      then run_deterministic grid_search2;       fi
 if [ "$RUN_GRID_SEARCH_NORM" = true ];  then run_deterministic grid_search_norm;   fi
 if [ "$RUN_GRID_SEARCH2_NORM" = true ]; then run_deterministic grid_search2_norm;  fi
+
+# epsilon-constraint search: sweeps an upper bound on production cost
+# rather than a weighting, minimising the other three objectives subject
+# to that bound. the bound is binding at the optimum, so the points come
+# out evenly spaced along the production cost axis by construction. it
+# normalises internally, so it takes no scale argument.
+if [ "$RUN_EPSILON_GRID_SEARCH" = true ]; then
+    run_deterministic epsilon_grid_search
+fi
 
 if [ "$RUN_PARETO_ARCHIVE" = true ]; then
     run_seeded pareto_archive $PARETO_ARCHIVE_SEEDS

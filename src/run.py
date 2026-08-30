@@ -540,7 +540,7 @@ def grid_search_lp_wts2(scale=None):
 
 
 
-def epsilon_grid_search(nsteps=500, delta=1e-3):
+def epsilon_grid_search(nsteps=500, delta=1e-3, endpoint_tol=1e-9):
     """Epsilon-constraint search: sweep a bound instead of a weighting.
 
     We minimise the other three objectives, normalised and summed,
@@ -565,24 +565,46 @@ def epsilon_grid_search(nsteps=500, delta=1e-3):
     the constrained objective, which rules out weakly-efficient points
     -- solutions where the bound binds but another objective could still
     be improved for free.  Set delta=0 for the plain method.
+
+    endpoint_tol handles the lower endpoint of the sweep.  At epsilon
+    equal to the ideal production cost the constraint can be satisfied
+    only with equality, so whether the LP is feasible there comes down
+    to the solver's feasibility tolerance, and in practice it reports
+    infeasible.  Rather than loosening every epsilon, we retry only the
+    ones that come back infeasible, with the bound relaxed by this
+    relative amount.  At a production cost of order 1e8 a relative
+    tolerance of 1e-9 is well under one currency unit, so it cannot
+    move the front by anything observable; it just lets the sweep reach
+    its own endpoint.
     """
     ideal, nadir, ranges = payoff_table()
 
     costs = []
     xs = []
+    n_retried = 0
     n_infeasible = 0
     for e in np.linspace(ideal[0], nadir[0], nsteps):
         res = lp_solve(delta, 1, 1, 1,
                        scale=ranges,
                        eps=(e, None, None, None))
         if res is None:
-            # epsilon below the ideal production cost: no solution
-            n_infeasible += 1
-            continue
+            # only the lower endpoint should land here, where the bound
+            # is attainable only with equality. relax it by a relative
+            # hair and retry; if it is still infeasible, the epsilon
+            # really is below the ideal and we skip it.
+            res = lp_solve(delta, 1, 1, 1,
+                           scale=ranges,
+                           eps=(e * (1 + endpoint_tol), None, None, None))
+            if res is None:
+                n_infeasible += 1
+                continue
+            n_retried += 1
         x, c = res
         costs.append(c)
         xs.append(x)
-    print(f"epsilon sweep: {len(costs)} solved, {n_infeasible} infeasible")
+    print(f"epsilon sweep: {len(costs)} solved "
+          f"({n_retried} needed the endpoint tolerance), "
+          f"{n_infeasible} infeasible")
 
     costs = np.array(costs)
     xs = np.array(xs)
