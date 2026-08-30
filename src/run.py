@@ -540,7 +540,7 @@ def grid_search_lp_wts2(scale=None):
 
 
 
-def epsilon_grid_search(nsteps=500, delta=1e-3, endpoint_tol=1e-9):
+def epsilon_grid_search(nsteps=100, delta=1e-3, endpoint_tol=1e-9):
     """Epsilon-constraint search: sweep a bound instead of a weighting.
 
     We minimise the other three objectives, normalised and summed,
