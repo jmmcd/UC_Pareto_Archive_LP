@@ -207,7 +207,12 @@ def analyse_save_ind(xbest, run_id, basedir):
         "algo": algo,
         "solar_size": solar_size,
         "seed": seed,
-        "plant_info_filename": plant_info_filename
+        "plant_info_filename": plant_info_filename,
+        # whether the weights were applied to normalised objectives, and
+        # if so the scale factors used. objective values in the
+        # objvals_ files are in raw units either way.
+        "normalise": normalise,
+        "scale": (None if scale is None else list(scale)),
     }
     open(fname, "w").write(repr(params) + "\n")
 
@@ -228,7 +233,10 @@ def analyse_save_ind(xbest, run_id, basedir):
 def lp_solve(technology_cost_wt,
              emissions_wt,
              env_wt,
-             sus_wt
+             sus_wt,
+             scale=None,
+             eps=None,
+             return_duals=False
              ):
     """The problem is an LP problem, if we take a single obj.
     Losses are linear. Costs are linear.
@@ -237,6 +245,32 @@ def lp_solve(technology_cost_wt,
     understand but maybe slower - see unused.py
 
     For IP (enforcing rounded decision variables), see unused.py
+
+    scale: if None (the default), the weights multiply the four raw
+    objectives, exactly as in the original experiments.  If given, it
+    must be a length-4 array of positive scale factors, and each weight
+    is divided by its objective's scale before use.  Passing the
+    objective ranges (see payoff_table) is what "normalising the
+    objectives" means: it makes a weight of 0.5 mean the same thing for
+    every objective, regardless of that objective's units.
+
+    Normalisation changes *which* solutions the search finds.  It never
+    changes how they are reported: the (PC, Em, EC, SC) returned here
+    are always in raw units, so fronts from normalised and unnormalised
+    runs are directly comparable.
+
+    eps: if given, a length-4 sequence of upper bounds on the four
+    objectives, with None for any objective that is left unconstrained.
+    This is the epsilon-constraint method: instead of steering the
+    search by moving the weights, we bound an objective directly and let
+    the LP find the best value of the others subject to that bound.  The
+    bound is normally binding, so sweeping it gives points at a spacing
+    we choose, in the objective's own units.
+
+    An epsilon below an objective's ideal value makes the problem
+    genuinely infeasible.  In that case we return None rather than
+    falling back to a different objective, so that infeasible epsilons
+    are visible to the caller instead of producing a misleading point.
 
     """
 
@@ -257,13 +291,16 @@ def lp_solve(technology_cost_wt,
                 solver.Add(X[i][j] == X[i][0],
                            name=f"thermal-solid {i,j} constant")
 
-    # effective supply = demand
-    for i in range(nplants):
-        for j in range(nhours):
-            solver.Add(sum(X[i][j] * (1 - lambda_i[i])
+    # effective supply = demand. we keep references to these
+    # constraints so that we can read off their dual values (shadow
+    # prices) later -- see duals.py
+    demand_constraints = []
+    for j in range(nhours):
+        c = solver.Add(sum(X[i][j] * (1 - lambda_i[i])
                            for i in range(nplants))
                        == demand[j],
                        name=f"effective supply == demand {j}")
+        demand_constraints.append(c)
 
     # Production cost, Emissions, Environmental Cost, Sustainability
     # Cost
@@ -288,12 +325,26 @@ def lp_solve(technology_cost_wt,
                    for j in range(nhours)
                    for i in range(nplants)) == SC)
 
+    # epsilon constraints: bound an objective directly
+    if eps is not None:
+        assert len(eps) == 4
+        for var, e in zip((PC, Em, EC, SC), eps):
+            if e is not None:
+                solver.Add(var <= float(e))
+
     # weights
     wts = np.array((technology_cost_wt, emissions_wt,
                     env_wt, sus_wt), dtype=float)
     # a grid search or random search could give all weights = zero,
     # so guard for that:
     if wts.sum() < 10e-7: wts = np.array((1, 1, 1, 1.0)) 
+    if scale is not None:
+        # normalise: divide each weight by its objective's scale, so
+        # that the weights refer to comparable quantities. we do this
+        # before the sum-to-one step, which is unchanged.
+        scale = np.asarray(scale, dtype=float)
+        assert scale.shape == (4,) and (scale > 0).all()
+        wts = wts / scale
     wts /= wts.sum()
 
     # objective: a weighted sum of the four objectives
@@ -316,6 +367,12 @@ def lp_solve(technology_cost_wt,
          solver.ABNORMAL: "ABNORMAL"
          # there are other results but have never seen them
          }
+
+    if result != solver.OPTIMAL and eps is not None:
+        # with epsilon constraints, a non-optimal result means the
+        # epsilons are infeasible. say so, rather than silently
+        # solving a different problem.
+        return None
 
     if result != solver.OPTIMAL:
         print("system not solved to optimality", result, d[result])
@@ -345,7 +402,14 @@ def lp_solve(technology_cost_wt,
     EC = EC.solution_value()
     SC = SC.solution_value()
 
-
+    if return_duals:
+        # dual value of the hour-j demand constraint = rate of change
+        # of the (weighted) objective per unit of extra demand in hour
+        # j. one value per hour. note these are in units of the
+        # *weighted* objective per kWh, so they are only a money price
+        # when wts = (1, 0, 0, 0).
+        duals = np.array([c.dual_value() for c in demand_constraints])
+        return x, (PC, Em, EC, SC), duals
 
     return x, (PC, Em, EC, SC)
 
@@ -386,6 +450,34 @@ def print_sensitivity(solver):
 
 
 
+def payoff_table():
+    """Solve each objective on its own, to get the ideal and nadir points.
+
+    Row k of the payoff table is the vector of all four objective values
+    at the solution that minimises objective k alone.  The ideal point
+    is the diagonal (each objective at its own best); the nadir point is
+    estimated as the column-wise worst, which is the standard estimate
+    for problems with more than two objectives.
+
+    Returns (ideal, nadir, ranges).  Pass ranges as lp_solve's scale
+    argument to normalise the objectives.
+    """
+    P = []
+    for k in range(4):
+        wts = [0.0] * 4
+        wts[k] = 1.0
+        x, costs = lp_solve(*wts)
+        P.append(costs)
+    P = np.array(P)
+    ideal = P.diagonal().copy()
+    nadir = P.max(axis=0)
+    ranges = nadir - ideal
+    # a degenerate objective (constant over the feasible set) would give
+    # a zero range and an undefined normalisation; fall back to 1.0
+    ranges[ranges <= 0] = 1.0
+    return ideal, nadir, ranges
+
+
 ###############################################################
 #
 # Grid search and metaheuristic search over weights, using Pareto
@@ -411,7 +503,7 @@ def pareto_front(costs):
 
 
 
-def grid_search_lp_wts():
+def grid_search_lp_wts(scale=None):
     # consider all combinations of the weights [0, 1, 10, 100, 1000,
     # 10000]
     wt_vals = [0] + [10**i for i in range(5)]
@@ -419,7 +511,7 @@ def grid_search_lp_wts():
     xs = []
     for (technology_cost_wt, emissions_wt, env_wt, sus_wt) in itertools.product(wt_vals, wt_vals, wt_vals, wt_vals):
         x, c = lp_solve(technology_cost_wt, emissions_wt,
-                        env_wt, sus_wt)
+                        env_wt, sus_wt, scale=scale)
         costs.append(c)
         xs.append(x)
     costs = np.array(costs)
@@ -428,7 +520,7 @@ def grid_search_lp_wts():
     return xs[pareto_front(costs)]
 
 
-def grid_search_lp_wts2():
+def grid_search_lp_wts2(scale=None):
     # take wt in 10,000 steps in [0, 1] and use that as prod wt
     # and 1-wt as emissions wt (ignore others as correlated
     # with emissions).
@@ -437,7 +529,7 @@ def grid_search_lp_wts2():
     xs = []
     for wt in np.linspace(0, 1, 10001):
         print(wt)
-        x, c = lp_solve(wt, 1-wt, 0, 0)
+        x, c = lp_solve(wt, 1-wt, 0, 0, scale=scale)
         if c not in costs:
             costs.append(c)
             xs.append(x)
@@ -448,7 +540,56 @@ def grid_search_lp_wts2():
 
 
 
-def pareto_archive_lp_wts(popsize, gens):
+def epsilon_grid_search(nsteps=500, delta=1e-3):
+    """Epsilon-constraint search: sweep a bound instead of a weighting.
+
+    We minimise the other three objectives, normalised and summed,
+    subject to an upper bound epsilon on production cost, and sweep
+    epsilon over a fine grid from its ideal to its nadir value.
+
+    Summing the other three is reasonable here because emissions,
+    environmental cost and sustainability cost are near-collinear (their
+    pairwise cosines are all above 0.94), so they do not really trade
+    off against each other -- only against production cost.  That keeps
+    the sweep one-dimensional; constraining all three separately, as in
+    the textbook method, would need a 3D grid of epsilons.
+
+    The epsilon constraint is binding at the optimum, so the points come
+    out spaced exactly as we asked for along the production cost axis.
+    That is the point of the method: a gap in the resulting front cannot
+    be a sampling failure, because we requested a point at every
+    epsilon.  A real gap appears instead as a jump in the *other*
+    objectives between neighbouring epsilons.
+
+    delta is the augmentation term (as in AUGMECON): a small weight on
+    the constrained objective, which rules out weakly-efficient points
+    -- solutions where the bound binds but another objective could still
+    be improved for free.  Set delta=0 for the plain method.
+    """
+    ideal, nadir, ranges = payoff_table()
+
+    costs = []
+    xs = []
+    n_infeasible = 0
+    for e in np.linspace(ideal[0], nadir[0], nsteps):
+        res = lp_solve(delta, 1, 1, 1,
+                       scale=ranges,
+                       eps=(e, None, None, None))
+        if res is None:
+            # epsilon below the ideal production cost: no solution
+            n_infeasible += 1
+            continue
+        x, c = res
+        costs.append(c)
+        xs.append(x)
+    print(f"epsilon sweep: {len(costs)} solved, {n_infeasible} infeasible")
+
+    costs = np.array(costs)
+    xs = np.array(xs)
+    return xs[pareto_front(costs)]
+
+
+def pareto_archive_lp_wts(popsize, gens, scale=None):
     # Pareto archive search over weights
 
     def halfnormal(mu, sigma):
@@ -463,7 +604,7 @@ def pareto_archive_lp_wts(popsize, gens):
             x[i] *= halfnormal(0, 10)
         return x
     def wt_fitness(x):
-        x, c = lp_solve(*x)
+        x, c = lp_solve(*x, scale=scale)
         return c
     def custom_init_pop():
         # want to ensure that each obj is solo-optimised 
@@ -483,7 +624,7 @@ def pareto_archive_lp_wts(popsize, gens):
     # search and is not slow
     xs = []
     for ind in pop:
-        x, c = lp_solve(*ind)
+        x, c = lp_solve(*ind, scale=scale)
         xs.append(x)
     return np.array(xs)
 
@@ -507,6 +648,14 @@ if __name__ == "__main__":
         print(sys.argv)
         raise ValueError("Usage: python run.py algo solar_size seed")
 
+    # an algo name ending in "_norm" means: normalise the objectives by
+    # their ranges before applying the weights. we strip the suffix to
+    # get the underlying algorithm, but keep the full name in algo, so
+    # that results land in their own directory and can never be
+    # confused with the unnormalised runs.
+    normalise = algo.endswith("_norm")
+    base_algo = algo[:-len("_norm")] if normalise else algo
+
     run_id = "_".join(map(
         str,
         [
@@ -521,6 +670,12 @@ if __name__ == "__main__":
     random.seed(seed)
 
     basedir = f"../results/{algo}/solar_{solar_size}/"
+
+    if normalise:
+        ideal, nadir, scale = payoff_table()
+        print("normalising by objective ranges:", scale)
+    else:
+        scale = None
     
     if algo == "lp":
         # just for a quick test, min prod cost
@@ -533,14 +688,17 @@ if __name__ == "__main__":
             print(fx['technology_cost'], fx['emissions'], fx['env_cost'], fx['sus_cost'])
         sys.exit()
         
-    elif algo == "grid_search":
-        xs = grid_search_lp_wts()
-    elif algo == "grid_search2":
-        xs = grid_search_lp_wts2()
-    elif algo == "pareto_archive":
-        xs = pareto_archive_lp_wts(1000, 10)
-    elif algo == "random_search":
-        xs = pareto_archive_lp_wts(10000, 1)
+    elif base_algo == "grid_search":
+        xs = grid_search_lp_wts(scale)
+    elif base_algo == "grid_search2":
+        xs = grid_search_lp_wts2(scale)
+    elif base_algo == "pareto_archive":
+        xs = pareto_archive_lp_wts(1000, 10, scale)
+    elif base_algo == "random_search":
+        xs = pareto_archive_lp_wts(10000, 1, scale)
+    elif base_algo == "epsilon_grid_search":
+        # this method normalises internally, so it takes no scale
+        xs = epsilon_grid_search()
     else:
         raise ValueError
     
