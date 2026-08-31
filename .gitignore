@@ -1,6 +1,9 @@
-results/
+# Bulk output of run.py / run_exps.sh: ~19k .dat files, ~180MB, and
+# regenerable from src/ + data/.  Everything paper-facing lives in
+# paper/figures/, paper/tables/ and derived/, which ARE tracked.
+runs/
 
-.DS_STORE
+.DS_Store
 
 
 # Byte-compiled / optimized / DLL files

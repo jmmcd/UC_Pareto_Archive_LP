@@ -1,0 +1,5 @@
+Technology,Cost/kWh,Dispatched (MWh/day),Cheaper by,then CO2,shift (MWh/day),Dearer by,then CO2 ,shift (MWh/day) 
+Hydro,1.4,48034.0,--,--,,+148%,+2.93%,"Solid +2908, Hydro -2222, Solar -469, Gas -365"
+Solid,4.4,86515.0,-60%,+5.76%,"Solid +5515, Hydro -4703, Solar -743, Gas -365",+27%,-1.03%,"Solid -1086, Hydro +631, Solar +257, Gas +234"
+Solar,6.6,756.0,-21%,-0.37%,"Solid -381, Hydro +242, Solar +83, Gas +71",+89%,+1.88%,"Solid +1880, Hydro -1317, Solar -381, Gas -258"
+Gas,12.0,2405.0,-47%,-2.82%,"Solid -3301, Hydro +1609, Gas +1210, Solar +619",--,--,

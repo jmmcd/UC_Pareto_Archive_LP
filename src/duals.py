@@ -19,7 +19,7 @@ when we are minimising production cost alone.  Everywhere else they are
 
 Usage:
     python duals.py            # sweeps solar sizes and weights, writes
-                               # ../results/duals/duals.csv and two figures
+                               # ../derived/duals.csv and three figures
 
 """
 
@@ -46,7 +46,15 @@ SOLAR_SIZES = (0, 10, 50, 100)
 # the duals are a real money price.
 WEIGHT_SWEEP = np.round(np.linspace(0.0, 1.0, 21), 3)
 
-OUTDIR = "../results/duals/"
+# Output roots, shared with sensitivity.py.  The split is by what
+# consumes the file, not by which script wrote it: FIGDIR and TABDIR
+# hold what the manuscript \includegraphics and \inputs, DERIVED holds
+# machine-readable summaries (some of which the notebook reads back).
+# The bulk run output under ../runs/ is git-ignored; all three of these
+# are tracked.
+FIGDIR = "../paper/figures/"
+TABDIR = "../paper/tables/"
+DERIVED = "../derived/"
 
 
 def reload_run(solar_size):
@@ -104,6 +112,111 @@ def identify_marginal(run, duals, wts, tol=1e-6):
     return names, types
 
 
+def interior_flat_unit(run, x, wts):
+    """The thermal-solid plant that is free to move, and its effective cost.
+
+    thermal-solid plants are held to a constant output across all 24 hours
+    (see run.py), so their 24 hourly variables collapse to a single degree
+    of freedom: the daily level.  At most one such plant is normally
+    strictly between its bounds -- the marginal baseload unit, the only
+    flat plant with headroom to move.
+
+    Note it is *not* a swing or regulating unit in the usual sense: it
+    cannot follow load, because it is pinned flat by construction.  Its one
+    free variable is the level of the whole day, which is why it cannot
+    answer a demand change in a single hour on its own (this produces the
+    "mixed" hours in identify_marginal()) and why it fixes the *level* of
+    the entire price curve rather than any one hour's price: see
+    check_identities().
+
+    Returns (name, effective cost) or ("", nan) if none is interior.
+    """
+    X = np.asarray(x).reshape((run.nplants, run.nhours))
+    eff = effective_costs(run, wts)
+    for i in range(run.nplants):
+        if run.plant_info["type"][i] != "thermal-solid":
+            continue
+        if run.LB[i, 0] + 1e-6 < X[i, 0] < run.UB[i, 0] - 1e-6:
+            return run.plant_info["name"][i], float(eff[i].mean())
+    return "", float("nan")
+
+
+def check_identities(df, tol=1e-9):
+    """Verify the two dual identities the write-up relies on.
+
+    (1) Daily mean.  Whenever a flat thermal-solid unit is interior, the
+        *mean* of the 24 hourly duals equals that unit's effective cost:
+
+            mean_h dual[h]  ==  eff_flat
+
+        Because the unit's output is one variable shared by all 24 hours,
+        its optimality condition prices the whole day at once rather than
+        any single hour.  This holds at every weight, and it is what sets
+        the overall level of the price curve.
+
+    (2) Mixed hour.  In the one hour with no other free plant, the dual is
+        whatever the identity above leaves over:
+
+            dual[h*]  ==  24 * eff_flat  -  sum_{h != h*} dual[h]
+
+        which is (1) rearranged.  This is why a mixed dual is not a
+        technology price and need not lie between any two plants' costs.
+    """
+    n1 = n2 = 0
+    for (solar, wt), g in df.groupby(["solar_size", "prod_cost_wt"]):
+        eff = g["flat_unit_eff"].iloc[0]
+        if not np.isfinite(eff):
+            continue
+        scale = tol * max(1.0, abs(eff))
+
+        err1 = abs(g["dual"].mean() - eff)
+        assert err1 <= scale, (
+            f"daily-mean identity failed at solar={solar}, wt={wt}: "
+            f"mean dual {g['dual'].mean()} != eff {eff} (err {err1})")
+        n1 += 1
+
+        mixed = g[g["marginal_type"] == "mixed"]
+        for _, row in mixed.iterrows():
+            others = g[g["hour"] != row["hour"]]["dual"].sum()
+            err2 = abs(row["dual"] - (len(g) * eff - others))
+            assert err2 <= scale, (
+                f"mixed-hour identity failed at solar={solar}, wt={wt}, "
+                f"hour={row['hour']}: err {err2}")
+            n2 += 1
+    print(f"identities verified: {n1} daily-mean, {n2} mixed-hour "
+          f"(tolerance {tol:g} relative)")
+
+
+def write_effective_cost_table(filename="effective_costs.csv"):
+    """Per-plant reference table: OFC, distance, loss, delivered cost.
+
+    The shadow prices are costs per kWh *delivered*, while the objective
+    coefficients are per kWh *produced*.  One kWh delivered from plant i
+    needs 1/(1 - lambda_i) produced, so the price we observe is
+
+        c_i / (1 - lambda_i),      lambda_i = k * distance_i
+
+    This table is the lookup that turns an observed dual back into a plant.
+    Costs and distances do not vary with the solar scenario (only New
+    Solar's capacity does), so one table covers all of them.
+    """
+    run = reload_run(SOLAR_SIZES[-1])
+    pi = run.plant_info
+    tab = pd.DataFrame({
+        "name": pi["name"],
+        "type": pi["type"],
+        "production_cost": pi["production_cost"],
+        "distance": pi["distance"],
+        "lambda": run.lambda_i,
+        "effective_cost": pi["production_cost"].values / (1 - run.lambda_i),
+    }).sort_values("effective_cost").reset_index(drop=True)
+    path = os.path.join(DERIVED, filename)
+    tab.to_csv(path, index=False)
+    print("wrote", path)
+    print(tab.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    return tab
+
+
 def sweep():
     """Solve across solar sizes and weights, collecting duals."""
     rows = []
@@ -113,6 +226,7 @@ def sweep():
             wts = (wt, 1 - wt, 0.0, 0.0)
             x, costs, duals = run.lp_solve(*wts, return_duals=True)
             names, types = identify_marginal(run, duals, wts)
+            flat_name, flat_eff = interior_flat_unit(run, x, wts)
             for j in range(run.nhours):
                 rows.append({
                     "solar_size": solar_size,
@@ -124,6 +238,8 @@ def sweep():
                     "marginal_type": types[j],
                     "technology_cost": costs[0],
                     "emissions": costs[1],
+                    "flat_unit": flat_name,
+                    "flat_unit_eff": flat_eff,
                 })
         print("solved solar_size =", solar_size)
     return pd.DataFrame(rows)
@@ -152,7 +268,7 @@ TYPE_CODES = {
     "thermal-gas": "G", "mixed": "·",
 }
 TYPE_LABELS = {
-    "hydro": "Hydro", "thermal-solid": "Lignite", "solar": "Solar",
+    "hydro": "Hydro", "thermal-solid": "Solid", "solar": "Solar",
     "thermal-gas": "Gas", "mixed": "Mixed (coupled hours)",
 }
 TYPE_ORDER = ["hydro", "thermal-solid", "solar", "thermal-gas", "mixed"]
@@ -216,7 +332,7 @@ def plot_marginal_technology(df, wt=1.0, filename="marginal_technology.pdf"):
     ax.set_title("Technology setting the marginal price",
                  fontsize=10, color=TEXT_PRIMARY, loc="left", pad=8)
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTDIR, filename), bbox_inches="tight")
+    plt.savefig(os.path.join(FIGDIR, filename), bbox_inches="tight")
     plt.close()
 
 
@@ -255,7 +371,7 @@ def plot_price_curves(df, wt=1.0, filename="price_curves.pdf"):
     ax.set_title("Hourly marginal cost, minimising production cost only",
                  fontsize=10, color=TEXT_PRIMARY, loc="left", pad=8)
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTDIR, filename), bbox_inches="tight")
+    plt.savefig(os.path.join(FIGDIR, filename), bbox_inches="tight")
     plt.close()
 
 
@@ -299,17 +415,21 @@ def plot_front_summary(df, filename="front_summary.pdf"):
     axes[0].legend(title="New solar", frameon=False, fontsize=8,
                    title_fontsize=8)
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTDIR, filename), bbox_inches="tight")
+    plt.savefig(os.path.join(FIGDIR, filename), bbox_inches="tight")
     plt.close()
 
 
 if __name__ == "__main__":
-    os.makedirs(OUTDIR, exist_ok=True)
+    for d in (FIGDIR, TABDIR, DERIVED):
+        os.makedirs(d, exist_ok=True)
     df = sweep()
-    df.to_csv(os.path.join(OUTDIR, "duals.csv"), index=False)
-    print("wrote", os.path.join(OUTDIR, "duals.csv"), df.shape)
+    df.to_csv(os.path.join(DERIVED, "duals.csv"), index=False)
+    print("wrote", os.path.join(DERIVED, "duals.csv"), df.shape)
+
+    check_identities(df)
+    write_effective_cost_table()
 
     plot_marginal_technology(df)
     plot_price_curves(df)
     plot_front_summary(df)
-    print("wrote figures to", OUTDIR)
+    print("wrote figures to", FIGDIR)

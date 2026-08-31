@@ -540,7 +540,7 @@ def grid_search_lp_wts2(scale=None):
 
 
 
-def epsilon_grid_search(nsteps=100, delta=1e-3, endpoint_tol=1e-9):
+def epsilon_grid_search(nsteps=500, delta=1e-3, endpoint_tol=1e-9):
     """Epsilon-constraint search: sweep a bound instead of a weighting.
 
     We minimise the other three objectives, normalised and summed,
@@ -691,7 +691,7 @@ if __name__ == "__main__":
     np.random.seed(seed) # seed both numpy and random module
     random.seed(seed)
 
-    basedir = f"../results/{algo}/solar_{solar_size}/"
+    basedir = f"../runs/{algo}/solar_{solar_size}/"
 
     if normalise:
         ideal, nadir, scale = payoff_table()

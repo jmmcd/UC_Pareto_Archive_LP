@@ -31,12 +31,12 @@ RUN_RANDOM_SEARCH=${RUN_RANDOM_SEARCH:-false}
 RUN_EPSILON_GRID_SEARCH=${RUN_EPSILON_GRID_SEARCH:-false}
 
 # run.py lives in src/ and expects to be run from there: it reads
-# ../data/ and writes ../results/. locate ourselves rather than
+# ../data/ and writes ../runs/. locate ourselves rather than
 # depending on the caller's working directory, so that this script can
 # be run from anywhere.
 cd "$(dirname "$0")/../src"
 
-RESULTS=../results
+RUNS=../runs
 
 SOLAR_SIZES="0 10 50 100"
 PARETO_ARCHIVE_SEEDS="0 1 2 3 4"
@@ -48,19 +48,19 @@ GRID_SEED=0
 
 
 # Run a deterministic algorithm once per solar size. Results go to
-# $RESULTS/<algo>/solar_<size>/.
+# $RUNS/<algo>/solar_<size>/.
 run_deterministic () {
     local algo=$1
     echo "=== $algo ==="
-    mkdir "$RESULTS/$algo"
+    mkdir "$RUNS/$algo"
     for solar in $SOLAR_SIZES; do
-        mkdir "$RESULTS/$algo/solar_$solar"
+        mkdir "$RUNS/$algo/solar_$solar"
         python run.py "$algo" "$solar" "$GRID_SEED"
     done
 }
 
 # Run a stochastic algorithm once per (seed, solar size). Each seed gets
-# its own results directory, $RESULTS/<algo>_seed_<seed>/, so that runs
+# its own run directory, $RUNS/<algo>_seed_<seed>/, so that runs
 # can be compared across seeds.
 run_seeded () {
     local algo=$1
@@ -68,19 +68,19 @@ run_seeded () {
     local seeds="$*"
     echo "=== $algo ==="
     for seed in $seeds; do
-        mkdir "$RESULTS/$algo"
+        mkdir "$RUNS/$algo"
         for solar in $SOLAR_SIZES; do
-            mkdir "$RESULTS/$algo/solar_$solar"
+            mkdir "$RUNS/$algo/solar_$solar"
             python run.py "$algo" "$solar" "$seed"
             # the Pareto archive saves the front at each generation to
             # generations.npy in the current directory; keep it, named
             # for the run that produced it
             if [ -f generations.npy ]; then
                 mv generations.npy \
-                   "$RESULTS/$algo/generations_${algo}_${solar}_${seed}.npy"
+                   "$RUNS/$algo/generations_${algo}_${solar}_${seed}.npy"
             fi
         done
-        mv "$RESULTS/$algo" "$RESULTS/${algo}_seed_${seed}"
+        mv "$RUNS/$algo" "$RUNS/${algo}_seed_${seed}"
     done
 }
 
