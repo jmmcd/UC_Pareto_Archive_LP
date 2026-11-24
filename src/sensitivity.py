@@ -1,30 +1,32 @@
 """Cost sensitivity: how far must a technology's cost move before the
 optimal dispatch changes?
 
-Dispatch in this LP is a merit order on *effective* (delivered) cost,
+For each technology we report the *stability interval*: the range of
+multipliers alpha on its production cost over which the baseline optimal
+schedule stays optimal, and what happens just past each end.
 
-    c_i(w) = (w . coeffs_i) / (1 - lambda_i),      lambda_i = k * distance_i
+The interval is found by bisection, and bisection is safe here.  Scaling
+one technology's cost by alpha moves the LP's cost vector along a line,
+and the set of cost vectors for which a fixed schedule is optimal is a
+convex cone -- so the set of alphas for which the baseline stays optimal
+is a single interval containing 1.  We test membership directly: the
+baseline is still optimal at alpha iff its cost, under the perturbed
+coefficients, equals the re-solved optimum (to OPT_RTOL).
 
--- see duals.py.  The optimum is a vertex, so it does not drift as a cost
-coefficient moves: it stays exactly put until the merit order changes,
-then jumps.  So the sensitivity question has a sharp answer.  For each
-technology we report the *stability interval*: the range of multipliers
-on its production cost over which the optimal schedule is unchanged, and
-what happens at each end.
+Note what we do *not* test: whether the solver returns the same schedule.
+The cost-optimal schedule here is nearly degenerate -- several schedules
+tie or nearly tie -- so a re-solve can return a different schedule of
+identical cost.  Comparing schedules mistakes those ties for flips, and
+is not monotone in alpha, so it cannot be bisected.
 
-Multiplying one technology's production cost by alpha never reorders that
-technology internally -- its plants share every coefficient except the
-loss factor, which divides all of them alike -- so every flip is a
-crossing between two different technologies.  That gives a finite,
-enumerable candidate set: for plant i in the technology and plant k
-outside it, the crossing multiplier solves c_i(alpha) == c_k.  We walk
-those candidates outward from alpha = 1 and re-solve just past each one,
-so the interval we report is the true first flip, not a bisection
-estimate, and the crossing that causes it is identified by construction.
-
-A crossing is necessary for the dispatch to change but not sufficient:
-reordering two plants that are both saturated, or both switched off, moves
-nothing.  Hence the re-solve.
+An earlier version of this script assumed that dispatch is a merit
+order, so that a flip can only happen where two technologies' effective
+costs cross, and probed only at those crossings.  That is not so: the
+lignite plants must run flat all day, which couples the 24 hours, and the
+LP trades lignite against *mixes* of other plants across hours.  Those
+trade-offs flip at multipliers where no two plants' costs cross.  It
+found breakevens 3-10x too far out.  The is_crossing column records, for
+each breakeven, whether it does coincide with a pairwise crossing.
 
 Usage:
     python sensitivity.py        # sweeps solar sizes at w = (1, 0, 0, 0),
@@ -36,6 +38,7 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib
+import matplotlib.ticker
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -61,21 +64,39 @@ WTS = (1.0, 0.0, 0.0, 0.0)
 # running for reasons no sensitivity table is going to settle.
 ALPHA_MIN, ALPHA_MAX = 0.1, 10.0
 
-# Where to re-solve, relative to a candidate crossing, when it is the
-# outermost one: far enough past it to be unambiguously on the other side.
-PROBE = 1.02
+# Bisection: the baseline counts as still optimal while its cost is within
+# OPT_RTOL of the re-solved optimum.  Production cost is ~5e8, so 1e-9 is
+# under one unit -- well above solver noise (the gap at alpha = 1 is ~1e-16)
+# and far below any real flip, whose cost advantage grows linearly from 0
+# at the breakeven.  At 100MW, 1e-9 and 1e-11 give breakevens within 0.001
+# percentage points of each other; 1e-7 moves them by up to 0.04.  BISECT_STEPS halvings of log(alpha)
+# over [ALPHA_MIN, ALPHA_MAX] locate a breakeven to ~1e-13 relative.
+OPT_RTOL = 1e-9
+BISECT_STEPS = 50
+
+# How far past a breakeven to solve for the flipped schedule: far enough
+# that the baseline is unambiguously no longer optimal, near enough that
+# no second flip intervenes.
+FLIP_STEP = 1e-3
 
 # The solar cost multiplier used for the schedule comparison figure in the
-# notebook.  Solar's *first* flip is at -21%, but that moves 83 MWh on a
-# 138 GWh day and is invisible in a schedule heatmap; -50% is not much
-# better.  Solar reaches round-the-clock operation at about -73%, so 0.25
-# is a round number safely inside that plateau, and the contrast is legible.
+# notebook.  At 100MW solar's *first* flip is at about -9%, but it moves
+# ~250 MWh on a 138 GWh day (52 MWh of it onto solar) and is invisible in a
+# schedule heatmap; at -50% solar still runs only 12 of 24 hours.  It
+# reaches round-the-clock operation between -72% and -73%, so 0.25 is a
+# round number safely inside that plateau, and the contrast is legible.
 # That the number has to be this large is itself the finding.
 SCHEDULE_ALPHA = 0.25
 
-# The scenario the paper table and figure report.  The breakevens are the
-# same in every scenario (see check_invariance), so this choice affects
-# only the dispatch levels and the consequence columns.
+# The lignite-emissions comparison: the min-emissions schedule with lignite
+# at its baseline CO2 and at today's value.  The value itself is defined
+# once, in run.SCENARIOS.  Minimising production cost would be no use here:
+# CO2 is not in that objective, so the schedule could not move.
+COAL_SCENARIO = "coal_co2_1.6"
+
+# The scenario the paper table and figure report.  The breakevens differ
+# between solar scenarios (see check_invariance and derived/sensitivity.csv),
+# though in every one each technology's nearer breakeven is within 15%.
 HEADLINE_SOLAR = 100
 
 
@@ -122,23 +143,59 @@ def dispatch(run, wts):
 def dispatch_changed(x, x_base, rtol=1e-6):
     """Has the schedule moved?
 
-    A flip swaps two technologies in the merit order, so it always moves a
-    whole plant's worth of energy -- the smallest plant here is 6 MW
-    against ~4.8 GW of demand.  There is no near-miss regime for the
-    tolerance to fall into.
+    Only for checking that a re-solve at unchanged coefficients
+    reproduces the baseline.  It is *not* a test for a flip: the optimum
+    is nearly degenerate, so a re-solve at perturbed coefficients can
+    return a different schedule of identical cost.  Use still_optimal().
     """
     return np.abs(x - x_base).sum() > rtol * np.abs(x_base).sum()
 
 
+def weighted_objective(costs, wts):
+    """The LP's scalar objective, from the four raw objective values."""
+    w = np.asarray(wts, dtype=float)
+    return float(np.dot(w / w.sum(), costs))
+
+
+def still_optimal(run, x_base, wts, rtol=OPT_RTOL):
+    """Is x_base optimal under the *current* (possibly perturbed)
+    coefficients?  Compares its cost against a fresh optimum, so ties --
+    other schedules of equal cost -- do not count as a change."""
+    _x, costs = run.lp_solve(*wts)
+    opt = weighted_objective(costs, wts)
+    f = run.f(x_base)
+    mine = weighted_objective([f["technology_cost"], f["emissions"],
+                               f["env_cost"], f["sus_cost"]], wts)
+    return mine <= opt + rtol * abs(opt)
+
+
+def breakeven(run, tech, wts, x_base, far):
+    """First multiplier on tech's production cost, going from 1 towards
+    `far`, at which x_base stops being optimal; None if it is still
+    optimal at `far`.  See the module docstring for why bisection is
+    valid."""
+    def ok(a):
+        with scaled_production_cost(run, tech, a):
+            return still_optimal(run, x_base, wts)
+    if ok(far):
+        return None
+    lo, hi = 1.0, far                  # ok(lo), not ok(hi)
+    for _ in range(BISECT_STEPS):
+        mid = np.sqrt(lo * hi)         # bisect in log(alpha)
+        lo, hi = (mid, hi) if ok(mid) else (lo, mid)
+    return float(hi)
+
+
 ###############################################################
 #
-# Candidate crossings and the first flip
+# Pairwise crossings -- a diagnostic only
 #
 ###############################################################
 
 
 def crossing_multipliers(run, tech, wts):
-    """Multipliers on tech's production cost at which the merit order changes.
+    """Multipliers on tech's production cost at which some plant of tech
+    and some plant outside it have equal effective cost.
 
     For plant i in tech and plant k outside it, c_i(alpha) == c_k gives
 
@@ -147,8 +204,9 @@ def crossing_multipliers(run, tech, wts):
     where rest_i is plant i's weighted cost excluding production cost.  At
     w = (1, 0, 0, 0) this is just the effective-cost ratio c_k / c_i.
 
-    Returns (down, up): candidates below and above 1, each sorted by
-    distance from 1, restricted to [ALPHA_MIN, ALPHA_MAX].
+    If dispatch were a pure merit order these would be the only places a
+    flip could happen.  It is not (see the module docstring); we use them
+    only to label each breakeven as at a crossing or not.
     """
     w = np.asarray(wts, dtype=float)
     w = w / w.sum()
@@ -168,37 +226,11 @@ def crossing_multipliers(run, tech, wts):
             continue                           # alpha cannot move this plant
         for k in np.flatnonzero(~inside):
             alphas.append((eff[k] - rest[i]) / prod_term[i])
-
-    a = np.unique(np.round(alphas, 9))
-    a = a[(a >= ALPHA_MIN) & (a <= ALPHA_MAX)]
-    down = sorted(a[a < 1.0], reverse=True)
-    up = sorted(a[a > 1.0])
-    return down, up
+    return np.unique(np.round(alphas, 12))
 
 
-def first_flip(run, tech, wts, x_base, candidates, outward):
-    """Walk candidate crossings outward; return the first that moves dispatch.
-
-    We re-solve strictly *between* consecutive candidates, so the probe is
-    never sitting on a tie, and any change we see is attributable to the
-    candidate we just stepped over.
-
-    Returns (alpha, x_new) for the flip, or (None, None) if no candidate
-    in range changes anything -- which is the honest answer for a
-    technology that is saturated (cheaper changes nothing, it is already
-    fully used) or switched off (dearer changes nothing).
-    """
-    for n, alpha in enumerate(candidates):
-        nxt = candidates[n + 1] if n + 1 < len(candidates) else None
-        if nxt is None:
-            probe = alpha * PROBE if outward else alpha / PROBE
-        else:
-            probe = np.sqrt(alpha * nxt)       # geometric midpoint
-        with scaled_production_cost(run, tech, probe):
-            x = dispatch(run, wts)
-        if dispatch_changed(x, x_base):
-            return float(alpha), x
-    return None, None
+def is_crossing(alpha, crossings, rtol=1e-6):
+    return bool(np.any(np.abs(crossings / alpha - 1) < rtol))
 
 
 def describe_flip(run, x, x_base, tol=0.5):
@@ -243,7 +275,7 @@ def analyse(solar_size, wts=WTS):
 
     rows = []
     for tech in techs:
-        down_cands, up_cands = crossing_multipliers(run, tech, wts)
+        crossings = crossing_multipliers(run, tech, wts)
         row = {
             "solar_size": solar_size,
             "type": tech,
@@ -257,19 +289,27 @@ def analyse(solar_size, wts=WTS):
             "dispatched_MWh": float(x_base[
                 (run.plant_info["type"] == tech).values].sum() / 1000.0),
         }
-        for label, cands, outward in (("down", down_cands, False),
-                                      ("up", up_cands, True)):
-            alpha, x = first_flip(run, tech, wts, x_base, cands, outward)
+        for label, far in (("down", ALPHA_MIN), ("up", ALPHA_MAX)):
+            alpha = breakeven(run, tech, wts, x_base, far)
             row[f"alpha_{label}"] = alpha
             row[f"pct_{label}"] = None if alpha is None else 100 * (alpha - 1)
-            if x is None:
+            row[f"crossing_{label}"] = (None if alpha is None
+                                        else is_crossing(alpha, crossings))
+            if alpha is None:
                 row[f"effect_{label}"] = ""
+                row[f"moved_MWh_{label}"] = None
                 row[f"d_emissions_{label}"] = None
                 row[f"d_prod_cost_{label}"] = None
             else:
+                step = (1 - FLIP_STEP) if far < 1 else (1 + FLIP_STEP)
+                with scaled_production_cost(run, tech, alpha * step):
+                    x = dispatch(run, wts)
                 # score the flipped schedule at the *true* coefficients
                 new = run.f(x)
                 row[f"effect_{label}"] = describe_flip(run, x, x_base)
+                # energy re-dispatched: half the L1 change, since every
+                # MWh that leaves one plant arrives at another
+                row[f"moved_MWh_{label}"] = np.abs(x - x_base).sum() / 2000
                 row[f"d_emissions_{label}"] = 100 * (
                     new["emissions"] / base["emissions"] - 1)
                 row[f"d_prod_cost_{label}"] = 100 * (
@@ -279,29 +319,48 @@ def analyse(solar_size, wts=WTS):
     return pd.DataFrame(rows)
 
 
-def check_crossings(df):
-    """Every reported flip must sit at a merit-order crossing.
+def check_intervals(df, solar_size=None, n_inner=4):
+    """Checks on the stability intervals.
 
-    analyse() only ever returns candidates from crossing_multipliers(), so
-    this is a check that the two stayed in step rather than an independent
-    derivation.  It also asserts the structural claim the write-up makes:
-    a technology that is fully dispatched has no downward flip, and one
-    that is entirely off has no upward flip.
+    Structural claims, which hold for any LP: a technology that runs at
+    nothing cannot gain by becoming dearer, so it has no upward flip.
+
+    And a check on the solver rather than on our reasoning: the interval
+    property (see the module docstring) says the baseline is optimal at
+    every multiplier between the two breakevens, so we re-test a few
+    interior points.  A failure here would mean the solver's optimum is
+    not reliable enough for the bisection to mean anything.
     """
     n = 0
     for _, r in df.iterrows():
         if r["dispatched_MWh"] <= 1e-6:
-            assert r["alpha_up"] is None or pd.isna(r["alpha_up"]), (
+            assert pd.isna(r["alpha_up"]), (
                 f"{r['type']} is not dispatched yet has an upward flip "
                 f"at {r['alpha_up']}")
             n += 1
-        if r["alpha_down"] is not None and not pd.isna(r["alpha_down"]):
+        if not pd.isna(r["alpha_down"]):
             assert ALPHA_MIN <= r["alpha_down"] < 1, r["alpha_down"]
             n += 1
-        if r["alpha_up"] is not None and not pd.isna(r["alpha_up"]):
+        if not pd.isna(r["alpha_up"]):
             assert 1 < r["alpha_up"] <= ALPHA_MAX, r["alpha_up"]
             n += 1
-    print(f"crossing checks passed: {n}")
+
+    sizes = df["solar_size"].unique() if solar_size is None else [solar_size]
+    for size in sizes:
+        run = reload_run(size)
+        x_base = dispatch(run, WTS)
+        for _, r in df[df["solar_size"] == size].iterrows():
+            lo = ALPHA_MIN if pd.isna(r["alpha_down"]) else r["alpha_down"]
+            hi = ALPHA_MAX if pd.isna(r["alpha_up"]) else r["alpha_up"]
+            # strictly inside, log-spaced, avoiding the ends themselves
+            for a in np.exp(np.linspace(np.log(lo), np.log(hi),
+                                        n_inner + 2)[1:-1]):
+                with scaled_production_cost(run, r["type"], a):
+                    assert still_optimal(run, x_base, WTS), (
+                        f"{r['type']}: baseline not optimal at x{a:.6g}, "
+                        f"inside its own stability interval")
+                n += 1
+    print(f"interval checks passed: {n}")
 
 
 def check_invariance(df, rtol=1e-9):
@@ -337,7 +396,11 @@ def check_invariance(df, rtol=1e-9):
 
 
 def fmt_pct(v):
-    return "--" if v is None or pd.isna(v) else f"{v:+.0f}%"
+    return "--" if v is None or pd.isna(v) else f"{v:+.1f}%"
+
+
+def fmt_mwh(v):
+    return "--" if v is None or pd.isna(v) else f"{v:.0f}"
 
 
 def fmt_pct2(v):
@@ -353,9 +416,11 @@ def write_table(df, solar_size, filename="stability_intervals"):
         "Cost/kWh": sub["production_cost"].values,
         "Dispatched (MWh/day)": sub["dispatched_MWh"].round(0).values,
         "Cheaper by": [fmt_pct(v) for v in sub["pct_down"]],
+        "moves (MWh/day)": [fmt_mwh(v) for v in sub["moved_MWh_down"]],
         "then CO2": [fmt_pct2(v) for v in sub["d_emissions_down"]],
         "shift (MWh/day)": sub["effect_down"].values,
         "Dearer by": [fmt_pct(v) for v in sub["pct_up"]],
+        "moves (MWh/day) ": [fmt_mwh(v) for v in sub["moved_MWh_up"]],
         "then CO2 ": [fmt_pct2(v) for v in sub["d_emissions_up"]],
         "shift (MWh/day) ": sub["effect_up"].values,
     })
@@ -373,8 +438,9 @@ def write_table(df, solar_size, filename="stability_intervals"):
         caption=(f"How far each technology's production cost must move "
                  f"before the cost-optimal schedule changes at all "
                  f"({solar_size} MW new solar, minimising production cost). "
-                 f"The CO2 columns give the resulting change in "
-                 f"emissions once the schedule has flipped, scored at true "
+                 f"``Moves'' is the energy re-dispatched once the schedule "
+                 f"has flipped, out of about 138 GWh/day; the CO2 columns "
+                 f"give the resulting change in emissions, scored at true "
                  f"costs. ``--'' means no change out to a factor of "
                  f"{ALPHA_MAX:g} in that direction."),
         label="tab:stability", float_format="%.1f")
@@ -413,7 +479,13 @@ def plot_tornado(df, solar_size, filename="tornado.pdf"):
 
     fig, ax = plt.subplots(figsize=(7.5, 0.62 * len(sub) + 1.9))
 
-    lo_lim, hi_lim = ALPHA_MIN * 0.8, ALPHA_MAX * 1.25
+    # the axis spans the closed ends with a margin on each side (room for
+    # the end labels), and at least +/-5%.  open ends run to the edge and
+    # say how far we looked.
+    down = sub["alpha_down"].dropna().astype(float).values
+    up = sub["alpha_up"].dropna().astype(float).values
+    lo_lim = min(0.95, np.exp(1.3 * np.log(down.min()))) if len(down) else 0.95
+    hi_lim = max(1.05, np.exp(1.45 * np.log(up.max()))) if len(up) else 1.05
     for y, (_, r) in enumerate(sub.iterrows()):
         open_lo, open_hi = pd.isna(r["alpha_down"]), pd.isna(r["alpha_up"])
         lo = lo_lim if open_lo else r["alpha_down"]
@@ -426,13 +498,15 @@ def plot_tornado(df, solar_size, filename="tornado.pdf"):
         # the bar instead, so that no number implies a breakeven we did
         # not find
         if open_lo:
-            ax.text(lo * 1.06, y, "no flip", ha="left", va="center",
+            ax.text(lo * 1.004, y, f"no flip to \u00d7{ALPHA_MIN:g}",
+                    ha="left", va="center",
                     fontsize=7.5, color="#fcfcfb", zorder=4)
         else:
             ax.text(lo, y, fmt_pct(r["pct_down"]) + "  ", ha="right",
                     va="center", fontsize=8, color=TEXT_SECONDARY, zorder=4)
         if open_hi:
-            ax.text(hi / 1.06, y, "no flip", ha="right", va="center",
+            ax.text(hi / 1.004, y, f"no flip to \u00d7{ALPHA_MAX:g}",
+                    ha="right", va="center",
                     fontsize=7.5, color="#fcfcfb", zorder=4)
         else:
             ax.text(hi, y, "  " + fmt_pct(r["pct_up"]), ha="left",
@@ -441,14 +515,17 @@ def plot_tornado(df, solar_size, filename="tornado.pdf"):
     ax.axvline(1.0, color="#8a8a86", linewidth=1.2, zorder=2)
     ax.set_xscale("log")
     ax.set_xlim(lo_lim, hi_lim)
-    ticks = [0.125, 0.25, 0.5, 1, 2, 4, 8]
+    pcts = [-50, -30, -20, -15, -10, -5, -2, 0, 2, 5, 10, 20, 50, 100]
+    ticks = [1 + p / 100 for p in pcts if lo_lim < 1 + p / 100 < hi_lim]
     ax.set_xticks(ticks)
-    ax.set_xticklabels([f"\u00d7{t:g}" for t in ticks])
+    ax.set_xticklabels([("0" if t == 1 else f"{100 * (t - 1):+.0f}%")
+                        .replace("-", "\u2212") for t in ticks])
+    ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
     ax.set_yticks(range(len(sub)))
     ax.set_yticklabels([TYPE_LABELS.get(t, t) for t in sub["type"]],
                        fontsize=9)
     ax.invert_yaxis()
-    ax.set_xlabel("Multiplier on production cost", fontsize=9,
+    ax.set_xlabel("Change in production cost (log scale)", fontsize=9,
                   color=TEXT_SECONDARY)
     ax.grid(axis="x", color="#e8e8e4", linewidth=0.8)
     ax.set_axisbelow(True)
@@ -485,6 +562,7 @@ def plot_consequences(df, filename="flip_consequences.pdf"):
     sizes = sorted(df["solar_size"].unique())
 
     for ax, (label, title) in zip(axes, panels):
+        ends = {}
         for tech in TYPE_ORDER:
             s = df[df["type"] == tech].sort_values("solar_size")
             if s.empty or s[f"d_emissions_{label}"].isna().all():
@@ -493,18 +571,21 @@ def plot_consequences(df, filename="flip_consequences.pdf"):
                     color=TYPE_COLOURS[tech], linewidth=2, marker="o",
                     markersize=5, markeredgecolor="#fcfcfb",
                     markeredgewidth=1.2, label=TYPE_LABELS[tech], zorder=3)
-            # direct label at the right-hand end, so identity is never
-            # colour-alone
-            ax.annotate(TYPE_LABELS[tech],
-                        (s["solar_size"].iloc[-1],
-                         s[f"d_emissions_{label}"].iloc[-1]),
+            end = (s["solar_size"].iloc[-1], s[f"d_emissions_{label}"].iloc[-1])
+            ends.setdefault((end[0], round(end[1], 4)), []).append(tech)
+        # direct labels at the right-hand end, so identity is never
+        # colour-alone.  several technologies often flip to the *same*
+        # neighbouring schedule, so their lines end on one point: one
+        # joined label there, rather than overprinted ones.
+        for (xe, ye), techs in ends.items():
+            ax.annotate(", ".join(TYPE_LABELS[t] for t in techs), (xe, ye),
                         textcoords="offset points", xytext=(6, 0),
                         fontsize=8, color=TEXT_SECONDARY, va="center")
         ax.axhline(0, color="#8a8a86", linewidth=1)
         ax.set_title(title, fontsize=9, color=TEXT_PRIMARY, loc="left", pad=6)
         ax.set_xlabel("New solar (MW)", fontsize=9, color=TEXT_SECONDARY)
         ax.set_xticks(sizes)
-        ax.set_xlim(-8, max(sizes) * 1.32)
+        ax.set_xlim(-8, max(sizes) * 1.55)
         ax.grid(axis="y", color="#e8e8e4", linewidth=0.8)
         ax.set_axisbelow(True)
         for side in ("top", "right"):
@@ -564,6 +645,62 @@ def write_schedules(solar_size=HEADLINE_SOLAR, alpha=SCHEDULE_ALPHA):
     return out
 
 
+def min_emissions_dispatch(run, rtol=1e-9):
+    """Lexicographic min-emissions schedule, shape (plants, hours).
+
+    Minimise emissions; then, holding emissions at that optimum, minimise
+    production cost.  Minimising emissions alone can leave ties, and the
+    solver may return a weakly-efficient one that costs more for no
+    emissions gain.  rtol relaxes the bound by a hair, for the same
+    reason as epsilon_grid_search's endpoint_tol: a bound that can only
+    be met with equality is at the mercy of the feasibility tolerance.
+    """
+    _x, costs = run.lp_solve(0.0, 1.0, 0.0, 0.0)
+    res = run.lp_solve(1.0, 0.0, 0.0, 0.0,
+                       eps=(None, costs[1] * (1 + rtol), None, None))
+    assert res is not None, "second stage infeasible"
+    x, _ = res
+    return np.asarray(x).reshape((run.nplants, run.nhours))
+
+
+def write_coal_schedules(solar_size=HEADLINE_SOLAR, scenario=COAL_SCENARIO):
+    """Min-emissions schedules with lignite CO2 at baseline and in the
+    given scenario, for the notebook to plot (same format as
+    write_schedules), plus a per-technology summary.
+
+    Both schedules are scored under *both* CO2 values, so the table shows
+    how much of the change in emissions is the coefficient alone (same
+    schedule, dearer coal) and how much is re-dispatch.
+    """
+    runs = {"base": reload_run(solar_size)}
+    runs[scenario] = reload_run(solar_size, scenario)
+    co2 = {s: r.plant_info.loc[r.plant_info["type"] == "thermal-solid",
+                               "CO2"].iloc[0] for s, r in runs.items()}
+    xs = {s: min_emissions_dispatch(r) for s, r in runs.items()}
+
+    rows = []
+    for s, x in xs.items():
+        r = runs[s]
+        tag = f"min_em_coal-{co2[s]:g}"
+        path = os.path.join(DERIVED, f"schedule_{tag}_{solar_size}MW.csv")
+        np.savetxt(path, r.f(x)["relative_supply"])
+        print("wrote", path)
+        row = {"schedule": tag, "solved with lignite CO2": co2[s]}
+        for t in TYPE_ORDER[:-1]:
+            m = (r.plant_info["type"] == t).values
+            row[f"{TYPE_LABELS[t]} MWh/day"] = x[m].sum() / 1000
+        row["production cost"] = r.f(x)["technology_cost"]
+        for s2, r2 in runs.items():
+            row[f"emissions at CO2={co2[s2]:g}"] = r2.f(x)["emissions"]
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    path = os.path.join(DERIVED, f"min_emissions_coal_{solar_size}MW.csv")
+    df.to_csv(path, index=False)
+    print("wrote", path)
+    print(df.T.to_string(float_format=lambda v: f"{v:.4g}"))
+    return df
+
+
 def check_baseline_matches_front(solar_size=HEADLINE_SOLAR, tol=1e-4):
     """The baseline panel is the schedule the paper already shows.
 
@@ -601,7 +738,7 @@ def check_baseline_matches_front(solar_size=HEADLINE_SOLAR, tol=1e-4):
     return err
 
 
-def write_captions(solar_size, filename="captions.tex"):
+def write_captions(solar_size, invariant, filename="captions.tex"):
     """LaTeX figure blocks for the two figures.
 
     The figures carry no titles or notes of their own, so everything a
@@ -613,18 +750,20 @@ def write_captions(solar_size, filename="captions.tex"):
         "tornado.pdf", "fig:tornado",
         f"Cost change needed to move the optimal schedule "
         f"({solar_size}~MW new solar, minimising production cost). "
-        f"Each bar spans the multipliers on that technology's production "
-        f"cost that leave the optimal schedule unchanged; its ends are the "
-        f"breakevens, annotated as percentage changes. The axis is "
-        f"logarithmic, so that halving and doubling a cost are equally far "
-        f"from the centre. A bar running to the plot edge, marked "
-        f"``no flip'', means the schedule does not change in that "
-        f"direction out to a factor of {ALPHA_MAX:g}: a technology that is "
-        f"already fully dispatched is unaffected by becoming cheaper, and "
-        f"one that is switched off is unaffected by becoming dearer. "
+        f"Each bar spans the changes in that technology's production "
+        f"cost over which the baseline schedule remains optimal; its ends "
+        f"are the breakevens, annotated as percentage changes, beyond "
+        f"which a different schedule is strictly cheaper. The axis is "
+        f"logarithmic, so that a fall and a rise by the same factor are "
+        f"equally far from the centre. A bar running to the plot edge, "
+        f"marked ``no flip'', means the schedule does not change in that "
+        f"direction out to a factor of {ALPHA_MAX:g}. "
         f"Technologies are ordered by their nearer breakeven, most "
-        f"fragile first. The breakevens are identical in all four solar "
-        f"scenarios."
+        f"fragile first. "
+        + ("The breakevens are identical in all four solar scenarios."
+           if invariant else
+           "The breakevens differ somewhat between solar scenarios; "
+           "see the supplementary table.")
     ), (
         "flip_consequences.pdf", "fig:consequences",
         f"What the first flip is worth. For each technology and each "
@@ -659,12 +798,13 @@ if __name__ == "__main__":
     df.to_csv(os.path.join(DERIVED, "sensitivity.csv"), index=False)
     print("wrote", os.path.join(DERIVED, "sensitivity.csv"), df.shape)
 
-    check_crossings(df)
-    check_invariance(df)
+    check_intervals(df, solar_size=HEADLINE_SOLAR)
+    invariant = check_invariance(df)
     write_table(df, solar_size=HEADLINE_SOLAR)
     plot_tornado(df, solar_size=HEADLINE_SOLAR)
     plot_consequences(df)
-    write_captions(HEADLINE_SOLAR)
+    write_captions(HEADLINE_SOLAR, invariant)
 
     check_baseline_matches_front()
     write_schedules()
+    write_coal_schedules()

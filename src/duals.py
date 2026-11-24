@@ -57,9 +57,10 @@ TABDIR = "../paper/tables/"
 DERIVED = "../derived/"
 
 
-def reload_run(solar_size):
-    """Import (or re-import) run.py for a given solar size."""
-    sys.argv = ["duals.py", "lp", str(solar_size), "0"]
+def reload_run(solar_size, scenario="base"):
+    """Import (or re-import) run.py for a given solar size, and
+    optionally one of run.SCENARIOS."""
+    sys.argv = ["duals.py", "lp", str(solar_size), "0", scenario]
     if "run" in sys.modules:
         del sys.modules["run"]
     import run

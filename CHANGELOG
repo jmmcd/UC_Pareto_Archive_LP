@@ -1,3 +1,72 @@
+* 23 Nov 2026:
+
+data/demand.csv now has one hourly demand column per day, headed by the
+date (03-Aug-26, 09-Jan-26, 14-Jul-21, 19-Jan-21). run.py and the
+notebook read it as a table and take 19-Jan-21, the original curve;
+baseline min production cost and min emissions re-solve to the existing
+runs/ values (0 and 100MW, to ~1e-15), so no rerun is needed.
+The summer days were meant as a sensitivity study, but the model has no
+feasible schedule for either: with lignite held flat all day, hydro, gas
+and solar must follow the whole daily range of demand, and they span at most
+1702-1802 MW (0-100MW new solar) against summer daily ranges of 1849 and
+1895. Prices and CO2 do not enter, so the 2026 data gives the same
+verdicts. New src/feasibility.py shows this (derived/demand_feasibility.csv,
+paper/tables/demand_feasibility{,_captions}.tex,
+paper/figures/demand_feasibility.pdf), checking every verdict with the LP.
+
+* 12 Nov 2026:
+
+New scenario update_2026: 2026 prices and coefficients changed
+together, read from data/2026/ (DATA_DIRS in run.py) rather than patched
+onto the baseline. data/2026/make_2026.py generates the files: hydro
+cost 1.6; lignite 5.0 c/kWh, 1.6 kg CO2/kWh, minimum output 40%; gas
+13.7; solar CO2 x1.6 (table and hourly profile); env and sus cost +10%.
+Fuel prices are 2020 prices plus inflation only (+14.3%, as for hydro),
+excluding CO2 charges: the source's 14.7 for lignite includes one, and
+with it lignite is the dearest and dirtiest plant, so the min-cost and
+min-emissions schedules coincide (cost and emissions spreads 0.01%).
+
+* 10 Nov 2026:
+
+Notebook no longer prints the full combined Pareto front as a LaTeX
+table: with the epsilon-constraint sweep it is ~540 points per solar
+size (was 44 before epsilon). It now writes
+paper/tables/pareto_front_counts.tex (points contributed by each
+method), pareto_front_representative_{solar}MW.tex (11 points evenly
+spaced along production cost, plus the min-emissions point) and the full
+fronts to derived/pareto_front_combined_{solar}MW.csv.
+
+* 8 Nov 2026:
+
+Alternative scenarios for reviewers (SCENARIOS in run.py, optional 4th
+argument to run.py, RUN_SCENARIOS in run_exps.sh, analysis in
+scenarios.py): New Solar distance 5/10/178.83 km; solar production cost
+5.7 and 4.8 c/kWh (both solar plants); lignite CO2 1.6 kg/kWh.
+Pareto archive now writes generations.npy into its run directory rather
+than the working directory, so runs can go in parallel.
+Fixed lp_solve's ABNORMAL fallback: when the fallback re-solve also
+failed, it returned an all-zero schedule (no demand met, every objective
+0), which dominated whole fronts. It now re-solves min production cost
+from scratch, and raises if even that fails. Hit twice in
+solar_cost_4.8 (grid_search_norm, pareto_archive seed 2, both 10MW);
+those two runs were regenerated. Baseline runs never hit it.
+scenarios.py refuses any result that does not meet demand.
+lp_solve now retries a numerical failure (ABNORMAL) with GLOP without
+presolve, then HiGHS, before the old min-production-cost fallback
+(SOLVE_ATTEMPTS). Existing runs/ results were produced without this.
+
+Fixed sensitivity.py stability intervals, which were wrong. It assumed
+dispatch is a merit order, so a flip can only happen where two plants'
+effective costs cross, and re-solved only at those crossings. The
+lignite flat-output constraint couples the hours, so flips happen where
+no costs cross (none of the true breakevens is at a crossing). Now
+bisects on "is the baseline schedule still optimal" (cost vs re-solved
+optimum; valid since the stable set is an interval, and immune to the
+many near-tied optima). At 100MW the breakevens move from e.g. solar
+-21%/+89% to -8.6%/+4.0%; every flip moves 100-330 MWh/day of ~138
+GWh and changes CO2 by at most 0.35%. Breakevens now differ between
+solar sizes. Table gains "moves (MWh/day)"; tornado axis adapts.
+
 * 20 June 2020:
 
 Pareto Archive search.

@@ -29,6 +29,17 @@ RUN_GRID_SEARCH_NORM=${RUN_GRID_SEARCH_NORM:-false}
 RUN_GRID_SEARCH2_NORM=${RUN_GRID_SEARCH2_NORM:-false}
 RUN_RANDOM_SEARCH=${RUN_RANDOM_SEARCH:-false}
 RUN_EPSILON_GRID_SEARCH=${RUN_EPSILON_GRID_SEARCH:-false}
+RUN_SCENARIOS=${RUN_SCENARIOS:-false}
+
+# Alternative scenarios (reviewer sensitivity runs). Each changes one
+# input relative to the baseline -- see SCENARIOS in run.py for exactly
+# what. Every algorithm the paper reports is re-run, at every solar size,
+# for each scenario. Results go to runs/scenarios/<scenario>/, mirroring
+# the layout of runs/. Override the list to run a subset, e.g. to run
+# scenarios in parallel in separate shells:
+#
+#     RUN_SCENARIOS=true SCENARIOS="solar_d5 solar_d10" ./run_exps.sh
+SCENARIOS=${SCENARIOS:-"solar_d5 solar_d10 solar_d178.83 solar_cost_5.7 solar_cost_4.8 coal_co2_1.6"}
 
 # run.py lives in src/ and expects to be run from there: it reads
 # ../data/ and writes ../runs/. locate ourselves rather than
@@ -37,6 +48,13 @@ RUN_EPSILON_GRID_SEARCH=${RUN_EPSILON_GRID_SEARCH:-false}
 cd "$(dirname "$0")/../src"
 
 RUNS=../runs
+
+# where results go, and which scenario run.py should apply. these are the
+# baseline values; the scenario loop at the bottom changes them. run.py
+# derives its own output directory from the scenario, and OUT must match
+# it: $RUNS for the baseline, $RUNS/scenarios/<scenario> otherwise.
+OUT=$RUNS
+SCENARIO=base
 
 SOLAR_SIZES="0 10 50 100"
 PARETO_ARCHIVE_SEEDS="0 1 2 3 4"
@@ -48,19 +66,19 @@ GRID_SEED=0
 
 
 # Run a deterministic algorithm once per solar size. Results go to
-# $RUNS/<algo>/solar_<size>/.
+# $OUT/<algo>/solar_<size>/.
 run_deterministic () {
     local algo=$1
     echo "=== $algo ==="
-    mkdir "$RUNS/$algo"
+    mkdir "$OUT/$algo"
     for solar in $SOLAR_SIZES; do
-        mkdir "$RUNS/$algo/solar_$solar"
-        python run.py "$algo" "$solar" "$GRID_SEED"
+        mkdir "$OUT/$algo/solar_$solar"
+        python run.py "$algo" "$solar" "$GRID_SEED" "$SCENARIO"
     done
 }
 
 # Run a stochastic algorithm once per (seed, solar size). Each seed gets
-# its own run directory, $RUNS/<algo>_seed_<seed>/, so that runs
+# its own run directory, $OUT/<algo>_seed_<seed>/, so that runs
 # can be compared across seeds.
 run_seeded () {
     local algo=$1
@@ -68,19 +86,19 @@ run_seeded () {
     local seeds="$*"
     echo "=== $algo ==="
     for seed in $seeds; do
-        mkdir "$RUNS/$algo"
+        mkdir "$OUT/$algo"
         for solar in $SOLAR_SIZES; do
-            mkdir "$RUNS/$algo/solar_$solar"
-            python run.py "$algo" "$solar" "$seed"
+            mkdir "$OUT/$algo/solar_$solar"
+            python run.py "$algo" "$solar" "$seed" "$SCENARIO"
             # the Pareto archive saves the front at each generation to
-            # generations.npy in the current directory; keep it, named
-            # for the run that produced it
-            if [ -f generations.npy ]; then
-                mv generations.npy \
-                   "$RUNS/$algo/generations_${algo}_${solar}_${seed}.npy"
+            # generations.npy in the run directory; keep it, named for
+            # the run that produced it
+            if [ -f "$OUT/$algo/solar_$solar/generations.npy" ]; then
+                mv "$OUT/$algo/solar_$solar/generations.npy" \
+                   "$OUT/$algo/generations_${algo}_${solar}_${seed}.npy"
             fi
         done
-        mv "$RUNS/$algo" "$RUNS/${algo}_seed_${seed}"
+        mv "$OUT/$algo" "$OUT/${algo}_seed_${seed}"
     done
 }
 
@@ -104,6 +122,25 @@ if [ "$RUN_PARETO_ARCHIVE" = true ]; then
 fi
 if [ "$RUN_RANDOM_SEARCH" = true ]; then
     run_seeded random_search $RANDOM_SEARCH_SEEDS
+fi
+
+# The same set of algorithms as the baseline, once per scenario. mkdir -p
+# for the scenario root only; the per-algorithm mkdirs inside the run
+# functions still refuse to overwrite existing results.
+if [ "$RUN_SCENARIOS" = true ]; then
+    for SCENARIO in $SCENARIOS; do
+        echo "##### scenario $SCENARIO #####"
+        OUT=$RUNS/scenarios/$SCENARIO
+        mkdir -p "$OUT"
+        run_deterministic grid_search
+        run_deterministic grid_search2
+        run_deterministic grid_search_norm
+        run_deterministic epsilon_grid_search
+        run_seeded pareto_archive $PARETO_ARCHIVE_SEEDS
+        run_seeded random_search $RANDOM_SEARCH_SEEDS
+    done
+    OUT=$RUNS
+    SCENARIO=base
 fi
 
 echo "done"

@@ -1,0 +1,5 @@
+Solar (MW),Front points,Distinct,Grid search,Grid search 2,Grid search norm,Epsilon constraint,Random search,Pareto archive
+0,536,533,10,19,3,500,3,1
+10,552,545,13,24,7,499,5,4
+50,542,540,13,21,3,499,3,3
+100,545,543,14,12,2,499,11,7
